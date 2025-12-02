@@ -11,7 +11,12 @@ from allo._mlir.passmanager import PassManager
 from ...utils import get_func_inputs_outputs, get_dtype_and_shape_from_type
 from .utils import allo_dtype_to_dslx_type
 from .instruction import InstructionEmitter
-from .memory import RAM_TEMPLATE, MemoryEmitter, discover_memory_bindings
+from .memory import (
+  RAM_TEMPLATE,
+  MemoryEmitter,
+  discover_memory_bindings,
+  discover_memory_bindings_pe,
+)
 
 
 class DslxFuncLowererBase:
@@ -251,7 +256,28 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
 
   def __init__(self, func):
     super(DslxStatefulLowerer, self).__init__(func)
-    self.memory_bindings, self.memory_map = discover_memory_bindings(self.func)
+
+    self.is_systolic = self.is_systolic()
+    self.is_pe = self.is_pe()
+
+    # prepare PE channel discovery state
+    self.channel_infos = []
+    self.channel_arg_keys = []
+    self.channel_map = {}
+    self.uses_channels = False
+
+    # if this looks like a PE, discover channel candidates first so we
+    # can avoid creating MemoryBinding objects for those args
+    if self.is_pe:
+      cis, ckeys = discover_memory_bindings_pe(self.func)
+      self.channel_infos = cis
+      self.channel_arg_keys = ckeys
+      self.channel_map = {ci['key']: ci for ci in cis} if cis else {}
+      self.uses_channels = bool(cis)
+
+    # discover memory bindings for remaining memrefs (skip channel args)
+    self.memory_bindings, self.memory_map = discover_memory_bindings(
+        self.func, channel_arg_keys=self.channel_arg_keys if self.uses_channels else None)
     self.mem_emitter = MemoryEmitter(self)
     self.uses_memory = any(b.needs_read or b.needs_write for b in self.memory_bindings)
     self.loop = None
@@ -263,6 +289,24 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
     self.loop_upper_bounds = []
     self.return_state_idx = 0  # index of the state variable returned by the func
     self._analyze()
+
+  # --------------------------------------------------------------
+  # simple systolic detectors
+  # --------------------------------------------------------------
+  def is_systolic(self) -> bool:
+    """Very simple check: True if function name contains 'systolic'."""
+    name = getattr(self.func, "name", None)
+    if not name:
+      return False
+    return "systolic" in name.value.lower()
+
+  def is_pe(self) -> bool:
+    """Very simple check: True if function name contains 'pe' or 'pe_kernel' or endswith '_pe'."""
+    name = getattr(self.func, "name", None)
+    if not name:
+      return False
+    ln = name.value.lower()
+    return ("pe_" in ln) or ("_pe" in ln) or (ln == "pe")
 
   # ================================================================
   # loop analysis
@@ -512,7 +556,18 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
     return updated
 
   def _handle_affine_load(self, op, lines, temp_memrefs, state_memrefs):
-    binding = self.memory_map.get(str(op.operands[0]))
+    mkey = str(op.operands[0])
+    # If this memref was converted to a simple channel (PE path), recv from it.
+    ci = self.channel_map.get(mkey)
+    if ci and ci.get('chan_dir') == 'in':
+      chan = ci['channel_name']
+      tok = self.new_tok()
+      val = self.new_tmp()
+      lines.append(f"    let ({tok}, {val}) = recv(join(), {chan});")
+      self.register(op.result, val)
+      self.track_token(tok)
+      return True
+    binding = self.memory_map.get(mkey)
     if binding and binding.needs_read:
       lines.extend(self.mem_emitter.emit_read(binding, op))
       return True
@@ -527,6 +582,18 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
 
   def _handle_affine_store(self, op, lines, temp_memrefs, state_memrefs, updated, predicate=None):
     val, mkey = self.lookup(op.operands[0]), str(op.operands[1])
+    # If this memref was converted to a simple channel (PE path), send to it.
+    ci = self.channel_map.get(mkey)
+    if ci and ci.get('chan_dir') == 'out':
+      chan = ci['channel_name']
+      token_expr = self._consume_tokens("join()", lines)
+      tok = self.new_tok()
+      if predicate:
+        lines.append(f"    let {tok} = send_if({token_expr}, {chan}, {predicate}, {val});")
+      else:
+        lines.append(f"    let {tok} = send({token_expr}, {chan}, {val});")
+      self.track_token(tok)
+      return True
     binding = self.memory_map.get(mkey)
     if binding and binding.needs_write:
       lines.extend(self.mem_emitter.emit_write(binding, op, predicate))
@@ -612,6 +679,14 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
       self.outputs[idx] = name
       channels.append(f"{name}: chan<{dslx_type}> out")
       handles.append(name)
+
+    # If this function was identified as a PE and produced channel
+    # candidates, emit simple data channels for them (no address).
+    if getattr(self, 'uses_channels', False):
+      for ci in self.channel_infos:
+        dir_decl = 'in' if ci.get('chan_dir') == 'in' else 'out'
+        channels.append(f"{ci['channel_name']}: chan<{ci['chan_dslx_type']}> {dir_decl}")
+        handles.append(ci['channel_name'])
 
     for binding in self.memory_bindings:
       if binding.needs_read:
