@@ -144,7 +144,7 @@ def discover_memory_bindings(func, channel_arg_keys={}):
   for arg_index, arg in enumerate(func_args):
     if not MemRefType.isinstance(arg.type):
       continue
-    if str(arg) in channel_arg_keys:
+    if channel_arg_keys and str(arg) in channel_arg_keys:
       continue
     mt = MemRefType(arg.type)
     shape = tuple(mt.shape)

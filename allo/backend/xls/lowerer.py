@@ -256,8 +256,7 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
 
   def __init__(self, func):
     super(DslxStatefulLowerer, self).__init__(func)
-
-    self.is_systolic = self.is_systolic()
+    self.is_systolic = False
     self.is_pe = self.is_pe()
 
     # prepare PE channel discovery state
@@ -291,15 +290,7 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
     self._analyze()
 
   # --------------------------------------------------------------
-  # simple systolic detectors
-  # --------------------------------------------------------------
-  def is_systolic(self) -> bool:
-    """Very simple check: True if function name contains 'systolic'."""
-    name = getattr(self.func, "name", None)
-    if not name:
-      return False
-    return "systolic" in name.value.lower()
-
+  # simple detectors
   def is_pe(self) -> bool:
     """Very simple check: True if function name contains 'pe' or 'pe_kernel' or endswith '_pe'."""
     name = getattr(self.func, "name", None)
@@ -989,6 +980,80 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
 
 
 # ================================================================
+# systolic lowerer (skeleton)
+# ================================================================
+class DslxSystolicLowerer(DslxStatefulLowerer):
+  """Skeleton lowerer for systolic-array style functions.
+
+  For now this is a thin subclass of `DslxStatefulLowerer` that exists
+  as a distinct type so the module-level dispatch can choose it.
+  Systolic-specific lowering (spawn, PE wiring, channel layouts) will
+  be implemented here in follow-up work.
+  """
+  def __init__(self, func):
+    super(DslxSystolicLowerer, self).__init__(func)
+    self.pe_dims = self._discover_pe_dims()
+    return
+
+  def _discover_pe_dims(self):
+    loop_stack = []
+
+    def visit_block(block):
+      for op in block.operations:
+        # push loop ops
+        if isinstance(op, (scf_d.ForOp, affine_d.AffineForOp)):
+          loop_stack.append(op)
+          # recurse into the loop body
+          body = self._loop_body(op)
+          ret = visit_block(body)
+          if ret is not None:
+            return ret
+          loop_stack.pop()
+          continue
+
+        # recurse into regions for if/while etc.
+        for region in op.regions:
+          for blk in region.blocks:
+            ret = visit_block(blk)
+            if ret is not None:
+              return ret
+
+        # identify func.call by asm or op name
+        asm = op.operation.get_asm() if hasattr(op.operation, 'get_asm') else str(op.operation)
+        if 'func.call' in asm:
+          # find callee name like '@PE_kernel' or '@pe_x'; conservative regex
+          m = re.search(r'@([A-Za-z0-9_]+)', asm)
+          if not m:
+            continue
+          callee = m.group(1)
+          if 'pe' in callee.lower():
+            # collect numeric upper-bounds from the current loop stack
+            numeric_ubs = []
+            for lop in loop_stack:
+              ub = self._extract_loop_upper_bound(lop)
+              if ub is not None:
+                mm = re.match(r's32:([0-9]+)', ub)
+                if mm:
+                  numeric_ubs.append(int(mm.group(1)))
+            # prefer the last two numeric bounds (innermost grid loops)
+            if len(numeric_ubs) > 2:
+              raise NotImplementedError(f"systolic array with >=2D not supported yet")
+            elif len(numeric_ubs) == 1:
+              return (1, numeric_ubs[0])
+            elif len(numeric_ubs) == 2:
+              return (numeric_ubs[-2], numeric_ubs[-1])
+            else:
+              raise NotImplementedError(f"cannot determine PE array dimensions for callee {callee}")
+
+    # start from top-level blocks
+    top_block = self.func.body.blocks[0]
+    return visit_block(top_block)
+
+  def emit_proc(self):
+    # Placeholder for systolic-specific proc emission; will implement next
+    return f"{self.pe_dims}"
+
+# ================================================================
 # module lowerer
 # ================================================================
 class DslxModuleLowerer:
@@ -1007,8 +1072,23 @@ class DslxModuleLowerer:
           for inner_op in block.operations
         )
 
-        lowerer_cls = DslxStatefulLowerer if has_loop else DslxCombLowerer
-        self.func_lowerers.append(lowerer_cls(op))
+        # perform simple name-based detection for systolic functions
+        name = getattr(op, "name", None)
+        is_systolic = False
+        if name:
+          is_systolic = "systolic" in name.value.lower()
+
+        # choose lowerer class cleanly without mutating the instance
+        if is_systolic:
+          lowerer_cls = DslxSystolicLowerer
+        elif has_loop:
+          lowerer_cls = DslxStatefulLowerer
+        else:
+          lowerer_cls = DslxCombLowerer
+
+        lowerer = lowerer_cls(op)
+        lowerer.is_systolic = is_systolic
+        self.func_lowerers.append(lowerer)
 
   def emit_module(self):
     body = "\n\n".join(fl.emit_proc() for fl in self.func_lowerers)
