@@ -992,8 +992,163 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
   """
   def __init__(self, func):
     super(DslxSystolicLowerer, self).__init__(func)
-    self.pe_dims = self._discover_pe_dims()
+    # perform a single analysis pass that discovers PE dims and
+    # classifies systolic loops (spawn vs temporal)
+    self.pe_dims = None
+    self.systolic_loops = []
+    self._analyze_systolic()
+    if not self.pe_dims or not self.systolic_loops:
+      raise RuntimeError("systolic lowerer requires detectable PE dims and systolic loops")
+
+    # Temporary mode: route all function arguments through channels
+    # for the systolic lowerer so we don't rely on MemoryEmitter/RAM
+    # handling while iterating on systolic emission.
+    self.memory_bindings = []
+    self.memory_map = {}
+    self.uses_memory = False
     return
+
+  def _analyze_systolic(self):
+    """Single-pass analysis that discovers PE dimensions and classifies loops.
+
+    Sets `self.pe_dims` to a tuple (rows, cols) when discoverable, and
+    populates `self.systolic_loops` with dicts: {'op', 'kind', 'ub_str'}.
+    """
+    self.systolic_loops = []
+    self.pe_dims = None
+
+    def scan_block(block, loop_stack):
+      # Walk ops in the block. If we encounter a loop, recurse with it
+      # on the loop_stack. If we encounter a func.call to a callee whose
+      # name contains 'pe', compute pe_dims from numeric bounds on loop_stack
+      for op in block.operations:
+        if isinstance(op, (scf_d.ForOp, affine_d.AffineForOp)):
+          # recurse into the loop body with this loop pushed
+          ret = scan_block(self._loop_body(op), loop_stack + [op])
+          if ret:
+            return True
+          continue
+
+        # recurse into any regions (if/while etc.)
+        for region in op.regions:
+          for blk in region.blocks:
+            if scan_block(blk, loop_stack):
+              return True
+
+        asm = op.operation.get_asm() if hasattr(op.operation, 'get_asm') else str(op.operation)
+        if 'func.call' in asm:
+          m = re.search(r'@([A-Za-z0-9_]+)', asm)
+          if not m:
+            continue
+          callee = m.group(1)
+          if 'pe' in callee.lower():
+            # compute numeric upper-bounds from loop_stack
+            numeric_ubs = []
+            for lop in loop_stack:
+              ub = self._extract_loop_upper_bound(lop)
+              if ub is not None:
+                mm = re.match(r's32:([0-9]+)', ub)
+                if mm:
+                  numeric_ubs.append(int(mm.group(1)))
+            if len(numeric_ubs) > 2:
+              raise NotImplementedError("systolic array with >=2D not supported yet")
+            elif len(numeric_ubs) == 1:
+              self.pe_dims = (1, numeric_ubs[0])
+            elif len(numeric_ubs) == 2:
+              self.pe_dims = (numeric_ubs[-2], numeric_ubs[-1])
+            else:
+              raise NotImplementedError(f"cannot determine PE array dimensions for callee {callee}")
+            return True
+      return False
+
+    # classify top-level loops in the top block
+    top_block = self.func.body.blocks[0]
+    for op in top_block.operations:
+      if isinstance(op, (scf_d.ForOp, affine_d.AffineForOp)):
+        # determine if this loop (or nested body) contains a func.call to a PE
+        contains_pe = scan_block(self._loop_body(op), [op])
+        ub_str = self._extract_loop_upper_bound(op)
+        kind = 'spawn_pe' if contains_pe else 'temporal'
+        self.systolic_loops.append({'op': op, 'kind': kind, 'ub_str': ub_str})
+    return
+
+  def _unroll_for(self, loop_op, body_emitter):
+    ub_str = self._extract_loop_upper_bound(loop_op)
+    if ub_str is None:
+      raise NotImplementedError("Cannot unroll loop with dynamic upper bound")
+    m = re.match(r's32:([0-9]+)', ub_str)
+    if not m:
+      raise NotImplementedError("Only literal integer loop bounds supported for unrolling")
+    ub = int(m.group(1))
+    lines = []
+    for i in range(ub):
+      lines.extend(body_emitter(i))
+    return lines
+
+  def _build_systolic_config(self):
+    """Return the inner body lines for the `config` block.
+
+    The body contains `let (...) = chan<...>("...");` lines that create
+    the internal channel pairs. The proc signature must already declare
+    the names (done by `_build_channel_decls`).
+    """
+    if not hasattr(self, 'systolic_loops') or self.systolic_loops is None:
+      self._analyze_systolic()
+
+    if not self.pe_dims:
+      return ""
+
+    rows, cols = self.pe_dims
+    elem_type = self.input_types[0] if getattr(self, 'input_types', None) and len(self.input_types) > 0 else "s32"
+
+    lines = []
+    # create a pair for horizontal channels (to_hor/from_hor)
+    lines.append(f"    let (to_hor, from_hor) = chan<{elem_type}, u32:1>[{rows + 1}][{cols}](\"hor_chans\");")
+    # create a pair for vertical channels (to_vert/from_vert)
+    lines.append(f"    let (to_vert, from_vert) = chan<{elem_type}, u32:1>[{rows}][{cols + 1}](\"vert_chans\");")
+    # create result channel pair
+    lines.append(f"    let (result_chans_out, result_chans_in) = chan<{elem_type}, u32:1>[{rows}][{cols}](\"result_chans\");")
+    # spawn PEs within unrolled loops (use PE dims to construct indices)
+    lines.append("")
+    lines.append("    // Spawn PEs in a grid")
+    lines.append(f"    unroll_for! (row, _): (u32, ()) in u32:0..u32:{rows} {{")
+    lines.append(f"      unroll_for! (col, _): (u32, ()) in u32:0..u32:{cols} {{")
+    lines.append(
+      "        spawn pe(" +
+      f"result_chans_out[row][col],  // result_out\n" +
+      "        " + f"from_hor[row][col],          // a_in\n" +
+      "        " + f"from_vert[row][col],          // b_in\n" +
+      "        " + f"to_hor[row][col + u32:1],    // a_out\n" +
+      "        " + f"to_vert[row + u32:1][col]     // b_out\n" +
+      "        );"
+    )
+    lines.append("      }(());")
+    lines.append("    }(());")
+    return "\n".join(lines)
+
+  def _systolic_config_body(self):
+    """Compatibility wrapper: return the inner `let ... = chan(...)` lines.
+
+    Kept as a separate helper to avoid changing the original `_build_systolic_config`.
+    """
+    if getattr(self, '_build_systolic_config', None):
+      # If the existing helper already produces the desired body, use it.
+      body = self._build_systolic_config()
+      # Heuristic: if body contains 'let (' it's the inner body; otherwise
+      # treat it as comments and produce a proper body here.
+      if 'let (' in body:
+        return body
+
+    # produce canonical inner body based on pe_dims
+    if not getattr(self, 'pe_dims', None):
+      return ""
+    rows, cols = self.pe_dims
+    elem_type = self.input_types[0] if getattr(self, 'input_types', None) and len(self.input_types) > 0 else "s32"
+    lines = []
+    lines.append(f"    let (to_hor, from_hor) = chan<{elem_type}, u32:1>[{rows + 1}][{cols}](\"hor_chans\");")
+    lines.append(f"    let (to_vert, from_vert) = chan<{elem_type}, u32:1>[{rows}][{cols + 1}](\"vert_chans\");")
+    lines.append(f"    let (result_chans_out, result_chans_in) = chan<{elem_type}, u32:1>[{rows}][{cols}](\"result_chans\");")
+    return "\n".join(lines)
 
   def _discover_pe_dims(self):
     loop_stack = []
@@ -1050,8 +1205,114 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     return visit_block(top_block)
 
   def emit_proc(self):
-    # Placeholder for systolic-specific proc emission; will implement next
-    return f"{self.pe_dims}"
+    # Assemble proc using systolic-specific config when available.
+    proc_name = self.func.name.value
+    channels = self._emit_channels()
+    # perform analysis and build config fragment from the results
+    self._analyze_systolic()
+    # Prefer a systolic-generated config body if available. We call a
+    # dedicated helper to return the inner `let ... = chan(...)` lines;
+    # the `config(...)` signature should list only external I/O channels.
+    systolic_body = self._systolic_config_body() if hasattr(self, '_systolic_config_body') else None
+    if systolic_body:
+      extern_chans = getattr(self, 'external_channels', self.channels)
+      config_section = (
+          f"  config({', '.join(extern_chans)}) {{\n"
+          f"{systolic_body}\n"
+          f"    ({', '.join(self.channel_handles)})\n"
+          f"  }}"
+      )
+      cfg_text = config_section
+    else:
+      cfg_text = self._emit_config()
+
+    init_section = self._emit_init()
+    next_section = self._emit_next()
+
+    func = f"pub proc {proc_name} {{\n"
+    func += channels + "\n\n"
+    func += cfg_text + "\n\n"
+    func += init_section + "\n\n"
+    func += next_section + "\n"
+    func += "}"
+    return func
+
+  # Override channel declarations so systolic lowerer sends all inputs
+  # (including memrefs/arrays) through simple data channels. Channel
+  # names prefer the original argument name when present, otherwise
+  # fall back to a positional name.
+  def _build_channel_decls(self):
+    inputs, outputs = get_func_inputs_outputs(self.func)
+    # include ALL function arguments for systolic path
+    func_args = list(self.func.arguments)
+    assert len(inputs) == len(func_args), "func arg mismatch"
+
+    self.input_types = []
+    self.scalar_arg_order = []
+    channels = []
+    self.inputs = {}
+    self.outputs = {}
+    handles = []
+
+    for idx, (arg, (dtype, shape)) in enumerate(zip(func_args, inputs)):
+      dslx_type = allo_dtype_to_dslx_type(dtype)
+      self.input_types.append(dslx_type)
+      # prefer a human-readable name if available on the MLIR arg
+      arg_name = None
+      try:
+        arg_name = getattr(arg, 'name', None)
+      except Exception:
+        arg_name = None
+      if not arg_name:
+        # BlockArgument typically exposes arg_number
+        try:
+          arg_name = f"arg{arg.arg_number}"
+        except Exception:
+          arg_name = f"in{idx}"
+      name = f"{arg_name}"
+      # sanitize name: replace spaces or special chars (conservative)
+      name = re.sub(r"[^A-Za-z0-9_]+", "_", name)
+      self.inputs[idx] = name
+      self.scalar_arg_order.append(arg)
+      channels.append(f"{name}: chan<{dslx_type}> in")
+      handles.append(name)
+
+    for idx, (dtype, shape) in enumerate(outputs):
+      dslx_type = allo_dtype_to_dslx_type(dtype)
+      # try to name outputs by position
+      name = f"out{idx}"
+      self.outputs[idx] = name
+      channels.append(f"{name}: chan<{dslx_type}> out")
+      handles.append(name)
+
+    # include channel candidates discovered earlier (if any)
+    if getattr(self, 'uses_channels', False):
+      for ci in self.channel_infos:
+        dir_decl = 'in' if ci.get('chan_dir') == 'in' else 'out'
+        channels.append(f"{ci['channel_name']}: chan<{ci['chan_dslx_type']}> {dir_decl}")
+        handles.append(ci['channel_name'])
+
+    self.external_channels = channels[:]
+    self.external_channel_handles = handles[:]
+
+    if getattr(self, 'pe_dims', None):
+      rows, cols = self.pe_dims
+      elem_type = self.input_types[0] if self.input_types else "s32"
+      # horizontal channels
+      channels.append(f"from_hor: chan<{elem_type}>[{rows + 1}][{cols}] in")
+      channels.append(f"to_hor: chan<{elem_type}>[{rows + 1}][{cols}] out")
+      handles.extend(["from_hor", "to_hor"])
+      # vertical channels
+      channels.append(f"from_vert: chan<{elem_type}>[{rows}][{cols + 1}] in")
+      channels.append(f"to_vert: chan<{elem_type}>[{rows}][{cols + 1}] out")
+      handles.extend(["from_vert", "to_vert"])
+      # result inbound channels (proc will recv from these)
+      channels.append(f"result_chans_in: chan<{elem_type}>[{rows}][{cols}] in")
+      handles.append("result_chans_in")
+
+    self.channel_handles = handles
+    self.control_channels = None
+    return channels
 
 # ================================================================
 # module lowerer
