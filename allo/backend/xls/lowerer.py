@@ -127,15 +127,23 @@ class DslxFuncLowererBase:
   # ================================================================
   # input helpers
   # ================================================================
-  def _recv_inputs(self, busy_guard, defaults=None, join_tokens=False):
+  def _recv_inputs(self, busy_guard, defaults=None, join_tokens=False, skip_array_inputs=False):
     defaults = defaults or []
     lines = []
     values = []
     tokens = []
+    default_idx = 0
     for idx, ch in enumerate(self.inputs.values()):
+      # Optionally skip array-typed inputs (they are handled differently
+      # by some lowerers like the systolic lowerer which recv them on the
+      # token path). Detect array-typed element by presence of '[' in
+      # the corresponding entry in `self.input_types`.
+      if skip_array_inputs and idx < len(self.input_types) and '[' in self.input_types[idx]:
+        continue
       tok = self.new_tok()
       val = self.new_tmp()
-      default = defaults[idx] if idx < len(defaults) else "s32:0"
+      default = defaults[default_idx] if default_idx < len(defaults) else "s32:0"
+      default_idx += 1
       lines.append(f"    let ({tok}, {val}) = recv_if(join(), {ch}, {busy_guard}, {default});")
       values.append(val)
       tokens.append(tok)
@@ -197,14 +205,18 @@ class DslxCombLowerer(DslxFuncLowererBase):
     channels = []
     handles = []
 
-    for idx, (arg, (dtype, shape)) in enumerate(zip(func_args, inputs)):
+    scalar_idx = 0
+    for arg, (dtype, shape) in zip(func_args, inputs):
+      if shape:
+        continue
       dslx_type = allo_dtype_to_dslx_type(dtype)
       self.input_types.append(dslx_type)
-      name = f"in{idx}"
-      self.inputs[idx] = name
+      name = f"in{scalar_idx}"
+      self.inputs[scalar_idx] = name
       self.scalar_arg_order.append(arg)
       channels.append(f"{name}: chan<{dslx_type}> in")
       handles.append(name)
+      scalar_idx += 1
 
     for idx, (dtype, shape) in enumerate(outputs):
       dslx_type = allo_dtype_to_dslx_type(dtype)
@@ -421,6 +433,50 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
       allocs |= self._collect_allocs_from_block(else_blk)
     return allocs
 
+  def _get_acc_types(self, desired_n=None):
+    """Return a list of accumulator DSLX types.
+
+    Preference order for each accumulator slot:
+      1. If `self.state` has an entry with a shaped DSLX type, use it.
+      2. Else if `self.input_types` provides a shaped type for that slot, use it.
+      3. Else fall back to the type recorded in `self.state` (may be scalar) or 's32'.
+    If `desired_n` is provided, return exactly that many entries (padding with 's32').
+    """
+    acc_types = []
+    # determine how many accumulators we should return
+    if desired_n is None:
+      if self.state:
+        desired_n = len(self.state)
+      elif getattr(self, 'input_types', None) and len(self.input_types) > 0:
+        # default to using first two input types when available
+        desired_n = 2 if len(self.input_types) >= 2 else 1
+      else:
+        desired_n = 0
+
+    for i in range(desired_n):
+      # prefer shaped type from state entry
+      if i < len(self.state):
+        _, t, _ = self.state[i]
+        if t and '[' in t:
+          acc_types.append(t)
+          continue
+      # fallback to input_types when shaped
+      if getattr(self, 'input_types', None) and i < len(self.input_types):
+        it = self.input_types[i]
+        if it and '[' in it:
+          acc_types.append(it)
+          continue
+      # otherwise take state type if present, else scalar default
+      if i < len(self.state):
+        _, t, _ = self.state[i]
+        acc_types.append(t or 's32')
+      elif getattr(self, 'input_types', None) and i < len(self.input_types):
+        acc_types.append(self.input_types[i])
+      else:
+        acc_types.append('s32')
+
+    return acc_types
+
   def _collect_memrefs(self, block, memrefs):
     used = set()
     for op in block.operations:
@@ -442,6 +498,31 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
         if else_blk:
           used |= self._collect_memrefs(else_blk, memrefs)
     return used
+
+  
+  def _zero_literal_from_dslx_type(self, dslx_type: str) -> str:
+    """Return a DSLX literal of zeros matching the given `dslx_type`.
+
+    Examples:
+      's32' -> 's32:0'
+      's32[2][2]' -> '[[s32:0, s32:0], [s32:0, s32:0]]'
+    """
+    if '[' not in dslx_type:
+      # scalar
+      return f"{dslx_type}:0"
+    # parse base and dims
+    base = dslx_type.split('[')[0]
+    dims = list(reversed([int(x[:-1]) for x in dslx_type.split('[')[1:]]))
+
+    leaf = f"{base}:0"
+
+    def nest(dim_list):
+      if len(dim_list) == 1:
+        return '[' + ', '.join([leaf] * dim_list[0]) + ']'
+      inner = nest(dim_list[1:])
+      return '[' + ', '.join([inner] * dim_list[0]) + ']'
+
+    return nest(dims)
 
   def _get_init(self, memref):
     func_args = list(self.func.arguments)
@@ -711,25 +792,48 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
   # init and next assembly
   # ================================================================
   def _emit_init(self):
-    fields = [
-      "0" if init and init.startswith("__arg") and init.endswith("__") else (init or "0")
-      for _, _, init in self.state
-    ]
+    # Determine accumulator initializers using shaped types when present.
+    fields = []
+    # prefer explicit state init values if provided (preserve __argN__ mapping)
+    acc_types = self._get_acc_types() if getattr(self, '_get_acc_types', None) else [t for _, t, _ in self.state]
+    num_accs = len(acc_types)
+    for i in range(num_accs):
+      # if a state entry provided an explicit init token (like __argN__), keep it
+      if i < len(self.state):
+        init = self.state[i][2]
+        if init and init.startswith("__arg") and init.endswith("__"):
+          fields.append("0" if init and init.startswith("__arg") and init.endswith("__") else (init or "0"))
+          continue
+      # otherwise produce a zero literal matching the accumulator type
+      dslx_t = acc_types[i]
+      fields.append(self._zero_literal_from_dslx_type(dslx_t))
     if self.loop_type == 'for':
       num_loops = len(self.loops) if self.loops else 1
       # for each loop level store index_i and upper_bound_i
       for i in range(num_loops):
-        fields.append("0")
+        fields.append("s32:0")
         if self._loop_bound_is_dynamic(i):
-          fields.append("0")
+          fields.append("s32:0")
       fields.append("false")  # busy flag
     else:
       fields.append("false")
     return f"  init {{ ({', '.join(fields)}) }}"
 
   def _emit_next(self):
+    # number of accumulator state entries; if none were discovered
+    # fall back to using the shaped input types (A,B) when available.
     n = len(self.state)
-    acc_names = [f"acc{i}" for i in range(n)]
+    # Determine accumulator DSLX types using helper that prefers shaped state
+    if getattr(self, '_get_acc_types', None):
+      acc_types = self._get_acc_types()
+      n = len(acc_types)
+      acc_names = [f"acc{i}" for i in range(n)]
+    else:
+      acc_types = [t for _, t, _ in self.state]
+      if n == 0 and getattr(self, 'input_types', None) and len(self.input_types) >= 2:
+        acc_types = [self.input_types[0], self.input_types[1]]
+        n = len(acc_types)
+        acc_names = [f"acc{i}" for i in range(n)]
     num_loops = len(self.loops) if self.loops else 1
     
     # handle while loops separately because they use a different state shape
@@ -771,7 +875,7 @@ class DslxStatefulLowerer(DslxFuncLowererBase):
     recv_defaults = [
         f"ub{i}" for i in range(num_loops) if self._loop_bound_is_dynamic(i)
     ]
-    recv_lines, scalar_inputs, base_tok = self._recv_inputs(busy_guard_expr, recv_defaults)
+    recv_lines, scalar_inputs, base_tok = self._recv_inputs(busy_guard_expr, recv_defaults, skip_array_inputs=True)
     lines.extend(recv_lines)
     
     ubs = []
@@ -997,6 +1101,9 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     self.pe_dims = None
     self.systolic_loops = []
     self._analyze_systolic()
+    # Track identities (ids) of loops we explicitly unroll (populated
+    # when emitting `unroll_for` sites). Start empty here.
+    self.unrolled_loop_ids = set()
     if not self.pe_dims or not self.systolic_loops:
       raise RuntimeError("systolic lowerer requires detectable PE dims and systolic loops")
 
@@ -1054,8 +1161,10 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
               raise NotImplementedError("systolic array with >=2D not supported yet")
             elif len(numeric_ubs) == 1:
               self.pe_dims = (1, numeric_ubs[0])
+              self.pe_callee = callee
             elif len(numeric_ubs) == 2:
               self.pe_dims = (numeric_ubs[-2], numeric_ubs[-1])
+              self.pe_callee = callee
             else:
               raise NotImplementedError(f"cannot determine PE array dimensions for callee {callee}")
             return True
@@ -1080,6 +1189,8 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     if not m:
       raise NotImplementedError("Only literal integer loop bounds supported for unrolling")
     ub = int(m.group(1))
+
+    self.unrolled_loop_ids.add(id(loop_op))
     lines = []
     for i in range(ub):
       lines.extend(body_emitter(i))
@@ -1092,14 +1203,13 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     the internal channel pairs. The proc signature must already declare
     the names (done by `_build_channel_decls`).
     """
-    if not hasattr(self, 'systolic_loops') or self.systolic_loops is None:
-      self._analyze_systolic()
-
-    if not self.pe_dims:
-      return ""
-
     rows, cols = self.pe_dims
     elem_type = self.input_types[0] if getattr(self, 'input_types', None) and len(self.input_types) > 0 else "s32"
+    # If the input type is an array (e.g. "s32[2][2]"), use the base
+    # element type for the internal channel element type (channels like
+    # to_hor/from_hor carry scalar elements, not whole matrices).
+    if '[' in elem_type:
+      elem_type = elem_type.split('[')[0]
 
     lines = []
     # create a pair for horizontal channels (to_hor/from_hor)
@@ -1111,10 +1221,13 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     # spawn PEs within unrolled loops (use PE dims to construct indices)
     lines.append("")
     lines.append("    // Spawn PEs in a grid")
+    # Note: we record unrolled loop identities when we actually
+    # unroll the loops in `_unroll_for`; no UB-string recording here.
     lines.append(f"    unroll_for! (row, _): (u32, ()) in u32:0..u32:{rows} {{")
     lines.append(f"      unroll_for! (col, _): (u32, ()) in u32:0..u32:{cols} {{")
+    pe_name = getattr(self, 'pe_callee', 'pe')
     lines.append(
-      "        spawn pe(" +
+      f"        spawn {pe_name}(" +
       f"result_chans_out[row][col],  // result_out\n" +
       "        " + f"from_hor[row][col],          // a_in\n" +
       "        " + f"from_vert[row][col],          // b_in\n" +
@@ -1144,11 +1257,60 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
       return ""
     rows, cols = self.pe_dims
     elem_type = self.input_types[0] if getattr(self, 'input_types', None) and len(self.input_types) > 0 else "s32"
+    if '[' in elem_type:
+      elem_type = elem_type.split('[')[0]
     lines = []
+    # Note: unrolled loop identities are recorded in `_unroll_for`.
     lines.append(f"    let (to_hor, from_hor) = chan<{elem_type}, u32:1>[{rows + 1}][{cols}](\"hor_chans\");")
     lines.append(f"    let (to_vert, from_vert) = chan<{elem_type}, u32:1>[{rows}][{cols + 1}](\"vert_chans\");")
     lines.append(f"    let (result_chans_out, result_chans_in) = chan<{elem_type}, u32:1>[{rows}][{cols}](\"result_chans\");")
     return "\n".join(lines)
+
+  def _prune_unrolled_loops(self):
+    """Remove loops identified as spawn/unrolled from the state's loop
+    tracking lists so they are not emitted as persistent indices.
+
+    This is intentionally systolic-specific so other lowerers are
+    unaffected.
+    """
+    # collect identities (ids) of spawn_pe loop ops using the underlying
+    # MLIR op object when available to increase the chance of a match
+    # with the `self.loops` entries.
+    spawn_ids = set()
+    for entry in self.systolic_loops:
+      if entry.get('kind') != 'spawn_pe':
+        continue
+      op = entry.get('op')
+      op_obj = getattr(op, 'operation', op)
+      spawn_ids.add(id(op_obj))
+    # combine with explicitly recorded unrolled op ids
+    unrolled_ids = set(getattr(self, 'unrolled_loop_ids', []))
+    prune_ids = spawn_ids.union(unrolled_ids)
+    if not prune_ids:
+      return
+    # if there are no previously-discovered loops, nothing to prune
+    if not getattr(self, 'loops', None):
+      return
+    new_loops = []
+    new_preambles = []
+    new_postambles = []
+    new_upper_bounds = []
+    for loop, pre, post, ub in zip(self.loops, self.loop_preambles, self.loop_postambles, self.loop_upper_bounds):
+      # If this loop's id is in the prune set, drop it. We compare
+      # using `id(...)` for stability within the Python process and to
+      # avoid relying on textual UB strings.
+      loop_obj = getattr(loop, 'operation', loop)
+      if id(loop_obj) in prune_ids:
+        continue
+      new_loops.append(loop)
+      new_preambles.append(pre)
+      new_postambles.append(post)
+      new_upper_bounds.append(ub)
+    # replace the old lists with the pruned versions
+    self.loops = new_loops
+    self.loop_preambles = new_preambles
+    self.loop_postambles = new_postambles
+    self.loop_upper_bounds = new_upper_bounds
 
   def _discover_pe_dims(self):
     loop_stack = []
@@ -1208,8 +1370,6 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     # Assemble proc using systolic-specific config when available.
     proc_name = self.func.name.value
     channels = self._emit_channels()
-    # perform analysis and build config fragment from the results
-    self._analyze_systolic()
     # Prefer a systolic-generated config body if available. We call a
     # dedicated helper to return the inner `let ... = chan(...)` lines;
     # the `config(...)` signature should list only external I/O channels.
@@ -1255,7 +1415,15 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     handles = []
 
     for idx, (arg, (dtype, shape)) in enumerate(zip(func_args, inputs)):
-      dslx_type = allo_dtype_to_dslx_type(dtype)
+      base_type = allo_dtype_to_dslx_type(dtype)
+      if shape:
+        # shape is expected to be an iterable of integer dims
+        # Flip the order of dimensions when emitting DSLX so that
+        # a shape (N, K) in Allo becomes a DSLX type `base[K][N]`.
+        shape_suffix = "".join(f"[{d}]" for d in reversed(shape))
+        dslx_type = f"{base_type}{shape_suffix}"
+      else:
+        dslx_type = base_type
       self.input_types.append(dslx_type)
       # prefer a human-readable name if available on the MLIR arg
       arg_name = None
@@ -1278,7 +1446,13 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
       handles.append(name)
 
     for idx, (dtype, shape) in enumerate(outputs):
-      dslx_type = allo_dtype_to_dslx_type(dtype)
+      base_type = allo_dtype_to_dslx_type(dtype)
+      if shape:
+        # Reverse dims for outputs as well (Allo -> DSLX ordering).
+        shape_suffix = "".join(f"[{d}]" for d in reversed(shape))
+        dslx_type = f"{base_type}{shape_suffix}"
+      else:
+        dslx_type = base_type
       # try to name outputs by position
       name = f"out{idx}"
       self.outputs[idx] = name
@@ -1297,8 +1471,11 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
 
     if getattr(self, 'pe_dims', None):
       rows, cols = self.pe_dims
+      # Internal channels carry scalar elements (strip array suffixes)
       elem_type = self.input_types[0] if self.input_types else "s32"
-      # horizontal channels
+      if '[' in elem_type:
+        elem_type = elem_type.split('[')[0]
+      # horizontal channels (external proc signature: no token-width here)
       channels.append(f"from_hor: chan<{elem_type}>[{rows + 1}][{cols}] in")
       channels.append(f"to_hor: chan<{elem_type}>[{rows + 1}][{cols}] out")
       handles.extend(["from_hor", "to_hor"])
@@ -1313,6 +1490,239 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     self.channel_handles = handles
     self.control_channels = None
     return channels
+
+  def _emit_next(self):
+    # Determine accumulator names and DSLX types.
+    # Prefer shaped types discovered from state entries or input_types via helper.
+    if getattr(self, '_get_acc_types', None):
+      acc_types = self._get_acc_types()
+      n = len(acc_types)
+      acc_names = [f"acc{i}" for i in range(n)]
+    else:
+      n = len(self.state)
+      acc_names = [f"acc{i}" for i in range(n)]
+      # determine accumulator DSLX types; prefer explicit `self.state` info
+      acc_types = [t for _, t, _ in self.state]
+      if n == 0 and getattr(self, 'input_types', None) and len(self.input_types) >= 2:
+        # default to two accumulators matching the first two input arg shapes
+        acc_types = [self.input_types[0], self.input_types[1]]
+        n = len(acc_types)
+        acc_names = [f"acc{i}" for i in range(n)]
+    num_loops = len(self.loops) if self.loops else 1
+
+    # handle while loops separately
+    if self.loop_type == 'while':
+      return self._emit_next_while(acc_names)
+
+    # build state tuple type as (accumulators, loop indices/ubs, busy)
+    # For systolic lowerer, loop indices/upper-bounds use signed 32-bit (s32).
+    loop_types = []
+    loop_state_vars = []
+    for i in range(num_loops):
+      loop_types.append("s32")
+      loop_state_vars.append(f"index{i}")
+      if self._loop_bound_is_dynamic(i):
+        loop_types.append("s32")
+        loop_state_vars.append(f"ub{i}")
+    # Compose the state type using discovered accumulators (or defaults)
+    state_type = "(" + ", ".join(acc_types + loop_types + ["bool"]) + ")"
+    state_vars = acc_names + loop_state_vars + ["busy"]
+
+    self.pending_tokens = []
+    lines = [f"  next(state: {state_type}) {{"]
+    lines.append(f"    let ({', '.join(state_vars)}) = state;")
+
+    # control/go handling like the base lowerer
+    if self.control_channels:
+      go_tok = self.new_tok()
+      go_val = self.new_tmp()
+      start_flag = self.new_tmp()
+      lines.append(f"    let ({go_tok}, {go_val}) = recv_if(join(), go, !busy, bool:0);")
+      self.track_token(go_tok)
+      lines.append(f"    let {start_flag} = !busy && ({go_val} == bool:1);")
+      busy_guard_expr = start_flag
+    else:
+      busy_guard_expr = "!busy"
+
+    # receive inputs (upper bounds for each loop level)
+    recv_defaults = [f"ub{i}" for i in range(num_loops) if self._loop_bound_is_dynamic(i)]
+    recv_lines, scalar_inputs, base_tok = self._recv_inputs(busy_guard_expr, recv_defaults, skip_array_inputs=True)
+    lines.extend(recv_lines)
+
+    # determine ubs
+    ubs = []
+    input_idx = 0
+    for i in range(num_loops):
+      if self._loop_bound_is_dynamic(i):
+        if input_idx < len(scalar_inputs):
+          ubs.append(scalar_inputs[input_idx])
+        else:
+          ubs.append(f"ub{i}")
+        input_idx += 1
+      else:
+        literal = self.loop_upper_bounds[i] if i < len(self.loop_upper_bounds) else None
+        ubs.append(literal or "s32:0")
+
+    # register induction vars and state memrefs
+    for i, loop_op in enumerate(self.loops):
+      self.register(self._loop_induction_var(loop_op), f"index{i}")
+    for i, (m, _, _) in enumerate(self.state):
+      self.register(m, acc_names[i])
+
+    # temporal index used as k (common convention)
+    k_var = "index0" if num_loops > 0 else "index0"
+
+    c_chan = list(self.outputs.values())[0] if self.outputs else "c_out"
+
+    # Systolic sends: send A to left, B to top -- always use channel-based
+    rows, cols = self.pe_dims
+    # Prepare tok0, a_mat2, b_mat2 similar to the canonical systolic example
+    in0 = self.inputs.get(0, 'in0')
+    in1 = self.inputs.get(1, 'in1')
+    lines.append(f"    let (tok0, a_mat2, b_mat2) = if {k_var} == s32:0 {{")
+    lines.append(f"      let (a_tok, a_recv) = recv(token(), {in0});")
+    lines.append(f"      let (b_tok, b_recv) = recv(token(), {in1});")
+    lines.append(f"      let tok = join(a_tok, b_tok);")
+    lines.append(f"      (tok, a_recv, b_recv)")
+    lines.append(f"    }} else {{")
+    # fall back to previous accumulator variables when not the first step
+    acc0 = acc_names[0] if len(acc_names) > 0 else 'acc0'
+    acc1 = acc_names[1] if len(acc_names) > 1 else 'acc1'
+    lines.append(f"      (token(), {acc0}, {acc1})")
+    lines.append(f"    }};")
+
+    lines.append("    // Send values of A to left side")
+    lines.append("    let tok1 = {")
+    lines.append(f"      let t = tok0;")
+    lines.append(f"      if {k_var} < {ubs[0] if ubs else f's32:{rows}'} {{")
+    lines.append(f"        unroll_for!(row,_):(u32, ()) in u32:0..u32:{rows} {{")
+    lines.append(f"          let t = send(t, to_hor[row][0], a_mat2[row][({k_var} as u32)]);")
+    lines.append("        }(());")
+    lines.append("      };")
+    lines.append("      t")
+    lines.append("    };\n")
+
+    lines.append("    // Send values of B to top side")
+    lines.append("    let tok2 = {")
+    lines.append(f"      let t = tok0;")
+    lines.append(f"      if {k_var} < {ubs[0] if ubs else f's32:{cols}'} {{")
+    lines.append(f"        unroll_for!(col,_):(u32, ()) in u32:0..u32:{cols} {{")
+    lines.append(f"          let t = send(t, to_vert[0][col], b_mat2[({k_var} as u32)][col]);")
+    lines.append("        }(());")
+    lines.append("      };")
+    lines.append("      t")
+    lines.append("    };\n")
+
+    # Drop values from edges
+    lines.append("    // Drop values from right side")
+    lines.append(f"    unroll_for!(row,_):(u32, ()) in u32:0..u32:{rows} {{")
+    lines.append(f"      recv_non_blocking(token(), from_hor[row][{cols}], s32:0);")
+    lines.append("    }(());\n")
+
+    lines.append("    // Drop values from bottom side")
+    lines.append(f"    unroll_for!(col,_):(u32, ()) in u32:0..u32:{cols}{{")
+    lines.append(f"      recv_non_blocking(token(), from_vert[{rows}][col], s32:0);")
+    lines.append("    }(());\n")
+
+    lines.append("    let tok3 = join(tok1, tok2);")
+
+    # Collect results on final iteration
+    final_k = f"s32:{rows + cols - 1}"
+    lines.append(f"    if {k_var} == {final_k} {{")
+    recv_tok = "tok3"
+    for r in range(rows):
+      for c in range(cols):
+        tname = f"t{r}{c}"
+        cname = f"c{r}{c}"
+        lines.append(f"      let ({tname}, {cname}) = recv({recv_tok}, result_chans_in[{r}][{c}]);")
+        recv_tok = tname
+    lines.append(f"      let tok_final = {recv_tok};")
+    rows_list = []
+    for r in range(rows):
+      elems = ", ".join(f"{f'c{r}{c}'}" for c in range(cols))
+      rows_list.append(f"[{elems}]")
+    mat_text = "[" + ", ".join(rows_list) + "]"
+    lines.append(f"      let c: s32[{rows}][{cols}] = {mat_text};")
+    # If the return-state memref is memory-backed, emit write requests
+    # instead of sending the whole matrix on a channel.
+    tok_send_written = False
+    if hasattr(self, 'return_state_idx') and self.return_state_idx < len(self.state):
+      ret_mem = self.state[self.return_state_idx][0]
+      out_binding = self.memory_map.get(str(ret_mem))
+    else:
+      out_binding = None
+
+    if out_binding and out_binding.needs_write:
+      # Emit per-element writes using the binding's address linearization.
+      lines.append("      let tok_send = {")
+      lines.append("        let t = tok_final;")
+      lines.append(f"        unroll_for!(row,_):(u32, ()) in u32:0..u32:{rows} {{")
+      lines.append(f"          unroll_for!(col,_):(u32, ()) in u32:0..u32:{cols} {{")
+      lines.append(f"            let addr_bits = ({out_binding.linearize(["(row as s32)", "(col as s32)"])}) as uN[{out_binding.addr_width}];")
+      lines.append(f"            let req = SimpleWriteReq<{out_binding.addr_param()}, {out_binding.data_param()}> {{ addr: addr_bits, data: (c[row][col] as {out_binding.dslx_type}) }};")
+      lines.append(f"            let tok_req = send(t, {out_binding.write_req_chan}, req);")
+      lines.append(f"            let (tok_resp, _) = recv(tok_req, {out_binding.write_resp_chan});")
+      lines.append(f"            let t = tok_resp;")
+      lines.append("          }(());")
+      lines.append("        }(());")
+      lines.append("        t")
+      lines.append("      };\n")
+      tok_send_written = True
+
+    if not tok_send_written:
+      lines.append(f"      let tok_send = send(tok_final, {c_chan}, c);\n")
+
+    # Build reset tuple: accumulator inits, zeroed indices/ubs, busy=false
+    acc_inits = [self._state_init_expr(i) for i in range(len(self.state))]
+    # determine accumulator types for zero literals
+    if getattr(self, '_get_acc_types', None):
+      acc_types = self._get_acc_types(len(self.state))
+    else:
+      acc_types = [t for _, t, _ in self.state]
+    reset_parts = []
+    for i, init_expr in enumerate(acc_inits):
+      if init_expr == "0":
+        # replace generic zero with shaped zero literal when appropriate
+        t = acc_types[i] if i < len(acc_types) else 's32'
+        reset_parts.append(self._zero_literal_from_dslx_type(t))
+      else:
+        reset_parts.append(init_expr)
+    for i in range(num_loops):
+      reset_parts.append("s32:0")
+      if self._loop_bound_is_dynamic(i):
+        reset_parts.append("s32:0")
+    reset_parts.append("false")
+    reset_tuple = "(" + ", ".join(reset_parts) + ")"
+    # If control channels are present, signal completion on the `done` channel
+    if self.control_channels:
+      # Send done true using the composed tok_send chain
+      done_send_tmp = self.new_tok()
+      lines.append(f"      let {done_send_tmp} = send(tok_send, done, bool:1);")
+    lines.append(f"      {reset_tuple}")
+    lines.append("    } else {")
+
+    # Advance indices (simple increment of innermost index) and carry matrices forward
+    next_indices = []
+    for i in range(num_loops):
+      if i == (num_loops - 1):
+        next_indices.append(f"index{i} + s32:1")
+      else:
+        next_indices.append(f"index{i}")
+      if self._loop_bound_is_dynamic(i):
+        next_indices.append(f"ub{i}")
+
+    # Compose next-state tuple: accumulators (pass-through A,B), indices..., busy=true
+    # Use a_mat2,b_mat2 as the accumulator placeholders if available, else acc_names
+    a_val = "a_mat2" if True else acc_names[0]
+    b_val = "b_mat2" if True else acc_names[1]
+    next_state_parts = [a_val, b_val] if len(acc_names) >= 2 else acc_names
+    next_state_parts.extend(next_indices)
+    next_state_parts.append("true")
+    lines.append(f"      ({', '.join(next_state_parts)})")
+    lines.append("    }")
+
+    lines.append("  }")
+    return "\n".join(lines)
 
 # ================================================================
 # module lowerer
