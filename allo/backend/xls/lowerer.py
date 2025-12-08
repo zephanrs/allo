@@ -5,70 +5,56 @@ import re
 from allo._mlir.dialects import func as func_d
 from allo._mlir.dialects import scf as scf_d, arith as arith_d, affine as affine_d
 from allo._mlir.dialects import memref as memref_d
-from allo._mlir.ir import BlockArgument
-from allo._mlir.ir import Module, MemRefType
+from allo._mlir.ir import BlockArgument, Module, MemRefType
 from allo._mlir.passmanager import PassManager
 from ...utils import get_func_inputs_outputs, get_dtype_and_shape_from_type
-from .utils import allo_dtype_to_dslx_type
+from .utils import allo_dtype_to_dslx_type, emit_float_defs
 from .instruction import InstructionEmitter
 from .memory import (
   RAM_TEMPLATE,
   MemoryEmitter,
   discover_memory_bindings,
   discover_memory_bindings_pe,
+  build_memory_channels,
 )
 
 
 class DslxFuncLowererBase:
+  # Base class for lowering a single MLIR func to a DSLX proc.
   def __init__(self, func: func_d.FuncOp):
     self.func = func
-
-    # mappings
-    self.value_map = {}  # mlir ssa names map to dslx identifiers
-    self.const_map = {}  # mlir ssa names map to dslx constant literals
-
-    # input and output channels
-    self.inputs = {}  # mlir arg index maps to dslx channel name
-    self.outputs = {}  # mlir return index maps to dslx channel name
-    self.channels = []  # channel declaration strings
-    self.input_types = []  # dslx types for inputs
-    self.channel_handles = []  # handles returned by config in declaration order
+    self.value_map = {}
+    self.const_map = {}
+    self.inputs = {}
+    self.outputs = {}
+    self.channels = []
+    self.input_types = []
+    self.channel_handles = []
     self.scalar_arg_order = []
-
-    # naming variables
     self.tmp_counter = 0
     self.tok_counter = 0
-
-    # instruction emitter
     self.inst_emitter = InstructionEmitter(self)
     self.pending_tokens = []
-    
-    # register all constants upfront
     self._register_all_constants()
 
-  # find and register every constant reachable inside the function
+  # Pre-register all constants so they're available during lowering.
   def _register_all_constants(self):
-    def visit_block(block):
+    def visit(block):
       for op in block.operations:
         if isinstance(op, arith_d.ConstantOp):
           self.inst_emitter.emit(op)
-        # recurse into nested regions
         for region in op.regions:
           for blk in region.blocks:
-            visit_block(blk)
-    
+            visit(blk)
     for block in self.func.body.blocks:
-      visit_block(block)
+      visit(block)
 
-  # ================================================================
-  # naming
-  # ================================================================
-  def new_tmp(self) -> str:
+  def new_tmp(self):
     name = f"tmp{self.tmp_counter}"
     self.tmp_counter += 1
     return name
 
-  def new_tok(self) -> str:
+  def new_tok(self):
     name = f"tok{self.tok_counter}"
     self.tok_counter += 1
     return name
@@ -80,19 +66,15 @@ class DslxFuncLowererBase:
     self.const_map[mlir_name] = dslx_name
 
   def lookup(self, mlir_name):
-    if mlir_name in self.const_map:
-      return self.const_map[mlir_name]
-    return self.value_map[mlir_name]
+    return self.const_map.get(mlir_name) or self.value_map[mlir_name]
 
   def track_token(self, token):
     if token and token != "join()":
       self.pending_tokens.append(token)
 
+  # Consume pending tokens into a joined token expression.
   def _consume_tokens(self, base_tok, lines):
-    tokens = []
-    if base_tok and base_tok != "join()":
-      tokens.append(base_tok)
-    tokens.extend(self.pending_tokens)
+    tokens = ([base_tok] if base_tok and base_tok != "join()" else []) + self.pending_tokens
     self.pending_tokens = []
     if not tokens:
       return "join()"
@@ -102,18 +84,10 @@ class DslxFuncLowererBase:
     lines.append(f"    let {joined} = join({', '.join(tokens)});")
     return joined
 
-  # ================================================================
-  # channels and config
-  # ================================================================
   def _func_args_for_io(self):
-    args = []
-    for arg in self.func.arguments:
-      if "!allo.stream" in str(arg.type):
-        continue
-      args.append(arg)
-    return args
+    return [arg for arg in self.func.arguments if "!allo.stream" not in str(arg.type)]
 
-  def _emit_channels(self) -> str:
+  def _emit_channels(self):
     self.channel_handles = []
     self.channels = self._build_channel_decls()
     return "\n".join([f"  {s};" for s in self.channels])
@@ -124,24 +98,14 @@ class DslxFuncLowererBase:
   def _emit_config(self):
     return f"  config({', '.join(self.channels)}) {{ ({', '.join(self.channel_handles)}) }}"
 
-  # ================================================================
-  # input helpers
-  # ================================================================
+  # Receive inputs with conditional guard.
   def _recv_inputs(self, busy_guard, defaults=None, join_tokens=False, skip_array_inputs=False):
     defaults = defaults or []
-    lines = []
-    values = []
-    tokens = []
-    default_idx = 0
+    lines, values, tokens = [], [], []
     for idx, ch in enumerate(self.inputs.values()):
-      # Optionally skip array-typed inputs (they are handled differently
-      # by some lowerers like the systolic lowerer which recv them on the
-      # token path). Detect array-typed element by presence of '[' in
-      # the corresponding entry in `self.input_types`.
       if skip_array_inputs and idx < len(self.input_types) and '[' in self.input_types[idx]:
         continue
-      tok = self.new_tok()
-      val = self.new_tmp()
+      tok, val = self.new_tok(), self.new_tmp()
       default = defaults[default_idx] if default_idx < len(defaults) else "s32:0"
       default_idx += 1
       lines.append(f"    let ({tok}, {val}) = recv_if(join(), {ch}, {busy_guard}, {default});")
@@ -151,12 +115,13 @@ class DslxFuncLowererBase:
         self.register(self.scalar_arg_order[idx], val)
     if not tokens:
       base_tok = "join()"
-    elif join_tokens and len(tokens) > 1:
-      join_tok = self.new_tmp()
-      lines.append(f"    let {join_tok} = join({', '.join(tokens)});")
-      base_tok = join_tok
     elif join_tokens:
-      base_tok = tokens[0]
+      if len(tokens) > 1:
+        join_tok = self.new_tmp()
+        lines.append(f"    let {join_tok} = join({', '.join(tokens)});")
+        base_tok = join_tok
+      else:
+        base_tok = tokens[0]
     else:
       base_tok = tokens[-1]
     return lines, values, base_tok
@@ -176,34 +141,25 @@ class DslxFuncLowererBase:
   def _emit_next(self):
     raise NotImplementedError
 
-  # ================================================================
-  # proc assembly
-  # ================================================================
   def emit_proc(self):
-    func = f"pub proc {self.func.name.value} {{\n"
-    func += self._emit_channels() + "\n\n"
-    func += self._emit_config() + "\n\n"
-    func += self._emit_init() + "\n\n"
-    func += self._emit_next() + "\n"
-    func += "}"
-    return func
+    return "\n".join([
+      f"pub proc {self.func.name.value} {{",
+      self._emit_channels(), "",
+      self._emit_config(), "",
+      self._emit_init(), "",
+      self._emit_next(),
+      "}"
+    ])
 
-
-# ================================================================
-# combinational lowerer
-# ================================================================
 class DslxCombLowerer(DslxFuncLowererBase):
   def _build_channel_decls(self):
     inputs, outputs = get_func_inputs_outputs(self.func)
     func_args = self._func_args_for_io()
-    assert len(inputs) == len(func_args), "func arg mismatch"
+    assert len(inputs) == len(func_args)
 
-    self.input_types = []
-    self.scalar_arg_order = []
-    self.inputs = {}
-    self.outputs = {}
-    channels = []
-    handles = []
+    self.input_types, self.scalar_arg_order = [], []
+    self.inputs, self.outputs = {}, {}
+    channels, handles = [], []
 
     scalar_idx = 0
     for arg, (dtype, shape) in zip(func_args, inputs):
@@ -231,39 +187,286 @@ class DslxCombLowerer(DslxFuncLowererBase):
   def _emit_inputs(self):
     lines = []
     for idx, mlir_arg in enumerate(self.scalar_arg_order):
-      chan = self.inputs[idx]
-      var = self.new_tmp()
-      tok = self.new_tok()
-      lines.append(f"    let ({tok}, {var}) = recv(join(), {chan});")
+      var, tok = self.new_tmp(), self.new_tok()
+      lines.append(f"    let ({tok}, {var}) = recv(join(), {self.inputs[idx]});")
       self.register(mlir_arg, var)
     return lines
 
   def _emit_body(self):
     lines = []
-    block = self.func.body.blocks[0]
-    for op in block.operations:
-      lines.extend(self.inst_emitter.emit(op))
+    ops = list(self.func.body.blocks[0].operations)
+    for idx, op in enumerate(ops):
+      if isinstance(op, affine_d.AffineForOp) and _is_unrolled_for(op):
+        emitter = UnrolledForEmitter(self, op, lines)
+        emitter.emit(ops[idx + 1:])
+      else:
+        lines.extend(self.inst_emitter.emit(op))
     return lines
-
-  # ---------------------------------------------------------------------
-  # init / next
-  # ---------------------------------------------------------------------
 
   def _emit_init(self):
     return "  init { () }"
 
   def _emit_next(self):
-    lines = ["  next(state: ()) {"]
-    lines.extend(self._emit_inputs())
-    lines.extend(self._emit_body())
-    lines.append("  }\n")
-    return "\n".join(lines)
+    return "\n".join(["  next(state: ()) {"] + self._emit_inputs() + self._emit_body() + ["  }"])
 
 
-# ================================================================
-# stateful lowerer
-# ================================================================
+def _is_unrolled_for(loop_op):
+  """Check if an affine.for has unroll=0 attribute and only accesses scalar memrefs."""
+  if not isinstance(loop_op, affine_d.AffineForOp):
+    return False
+  # Check unroll attribute - if specified, must be 0
+  unroll_attr = None
+  for attr in loop_op.attributes:
+    if attr.name == "unroll":
+      unroll_attr = attr
+      break
+  if unroll_attr is not None:
+    # Assert that unroll factor is 0 if specified
+    attr_str = str(unroll_attr.attr)
+    m = re.search(r"(\d+)\s*:", attr_str)
+    assert m is not None, f"Could not parse unroll factor from: {attr_str}"
+    unroll_factor = int(m.group(1))
+    assert unroll_factor == 0, f"If unrolling, loop must be fully unrolled, got: {unroll_factor}"
+  else:
+    return False
+  # Check only scalar memref access (no arrays)
+  body = loop_op.body if hasattr(loop_op, "body") else list(loop_op.region.blocks)[0]
+  for op in body.operations:
+    if isinstance(op, affine_d.AffineLoadOp):
+      mt = MemRefType(op.operands[0].type)
+      if mt.shape:
+        return False
+    elif isinstance(op, affine_d.AffineStoreOp):
+      mt = MemRefType(op.operands[1].type)
+      if mt.shape:
+        return False
+  return True
+
+
+def _has_non_unrolled_loops(func):
+  """Check if function has any non-unrolled for loops or while loops."""
+  def check_block(block):
+    for op in block.operations:
+      if isinstance(op, scf_d.WhileOp):
+        return True
+      if isinstance(op, scf_d.ForOp):
+        return True
+      if isinstance(op, affine_d.AffineForOp):
+        if not _is_unrolled_for(op):
+          return True
+        # Check nested loops in body
+        body = op.body if hasattr(op, "body") else list(op.region.blocks)[0]
+        if check_block(body):
+          return True
+      for region in op.regions:
+        for blk in region.blocks:
+          if check_block(blk):
+            return True
+    return False
+  return check_block(func.body.blocks[0])
+
+
+def _get_loop_body(loop_op):
+  """Get the body block of a loop operation."""
+  if hasattr(loop_op, "body"):
+    return loop_op.body
+  if hasattr(loop_op, "region"):
+    return list(loop_op.region.blocks)[0]
+  raise NotImplementedError(f"unsupported loop: {type(loop_op)}")
+
+
+def _extract_for_upper_bound(loop_op):
+  """Extract upper bound from affine.for loop."""
+  try:
+    header = loop_op.operation.get_asm().splitlines()[0]
+  except AttributeError:
+    header = str(loop_op.operation).splitlines()[0]
+  match = re.search(r"\bto\b\s+([0-9]+)", header)
+  return match.group(1) if match else None
+
+
+class UnrolledForEmitter:
+  """Helper class to emit DSLX for expressions for unrolled affine.for loops."""
+
+  def __init__(self, lowerer, loop_op, lines, indent="    "):
+    self.lowerer = lowerer
+    self.loop_op = loop_op
+    self.lines = lines
+    self.indent = indent
+    self.body = _get_loop_body(loop_op)
+    self.upper_bound = _extract_for_upper_bound(loop_op)
+    self.carried = []  # [(memref_key, dslx_type, init_expr)]
+    self.used_after = set()  # memref keys used after loop
+    self.local_temps = {}
+
+  def _find_carried_and_usage(self, ops_after_loop):
+    """Find loop-carried values and which are used after the loop."""
+    # Find memrefs loaded/stored in loop body (loop-carried)
+    loaded, stored = set(), set()
+    def scan_body(block):
+      for op in block.operations:
+        if isinstance(op, affine_d.AffineLoadOp):
+          mt = MemRefType(op.operands[0].type)
+          if not mt.shape:
+            loaded.add(str(op.operands[0]))
+        elif isinstance(op, affine_d.AffineStoreOp):
+          mt = MemRefType(op.operands[1].type)
+          if not mt.shape:
+            stored.add(str(op.operands[1]))
+        elif isinstance(op, affine_d.AffineForOp) and _is_unrolled_for(op):
+          scan_body(_get_loop_body(op))
+        for region in op.regions:
+          for blk in region.blocks:
+            scan_body(blk)
+    scan_body(self.body)
+    carried_keys = loaded & stored
+
+    # Build carried list with types
+    for op in self.body.operations:
+      if isinstance(op, affine_d.AffineLoadOp):
+        mkey = str(op.operands[0])
+        if mkey in carried_keys and mkey not in [c[0] for c in self.carried]:
+          mt = MemRefType(op.operands[0].type)
+          dtype, _ = get_dtype_and_shape_from_type(mt.element_type)
+          init_expr = self.lowerer.lookup(op.operands[0])
+          self.carried.append((mkey, allo_dtype_to_dslx_type(dtype), init_expr, op.operands[0]))
+
+    # Find which carried values are used after the loop
+    def scan_usage(ops):
+      for op in ops:
+        if isinstance(op, affine_d.AffineLoadOp):
+          mkey = str(op.operands[0])
+          if mkey in carried_keys:
+            self.used_after.add(mkey)
+        for region in op.regions:
+          for blk in region.blocks:
+            scan_usage(blk.operations)
+    scan_usage(ops_after_loop)
+
+  def emit(self, ops_after_loop=None):
+    """Emit the DSLX for expression and return updated memref mappings."""
+    ops_after_loop = ops_after_loop or []
+    self._find_carried_and_usage(ops_after_loop)
+
+    if not self.carried:
+      # No loop-carried state, just emit body inline (will be unrolled)
+      for op in self.body.operations:
+        if isinstance(op, affine_d.AffineYieldOp):
+          continue
+        self.lines.extend(self.lowerer.inst_emitter.emit(op))
+      return
+
+    ub = self.upper_bound
+    if not ub:
+      raise NotImplementedError("Dynamic bounds not supported for unrolled for")
+
+    # Register loop induction variable
+    idx_var = self.lowerer.new_tmp()
+    if hasattr(self.loop_op, "induction_variable"):
+      self.lowerer.register(self.loop_op.induction_variable, idx_var)
+    elif self.body.arguments:
+      self.lowerer.register(self.body.arguments[0], idx_var)
+
+    # Build accumulator type and initial value
+    if len(self.carried) == 1:
+      acc_type = self.carried[0][1]
+      acc_var = self.lowerer.new_tmp()
+      init_val = self.carried[0][2]
+    else:
+      acc_type = f"({', '.join(c[1] for c in self.carried)})"
+      acc_var = self.lowerer.new_tmp()
+      init_val = f"({', '.join(c[2] for c in self.carried)})"
+
+    # Build result destructuring with _ for unused values
+    result_names = []
+    for mkey, _, _, memref in self.carried:
+      if mkey in self.used_after:
+        result_names.append(self.lowerer.new_tmp())
+      else:
+        result_names.append("_")
+
+    if len(self.carried) == 1:
+      result_pattern = result_names[0]
+    else:
+      result_pattern = f"({', '.join(result_names)})"
+
+    # Emit for loop header: let (results) = for (i, acc) in type:0..type:N { ... }(init);
+    self.lines.append(f"{self.indent}let {result_pattern} = for ({idx_var}, {acc_var}): (s32, {acc_type}) in s32:0..s32:{ub} {{")
+
+    # Register accumulators for use in body
+    if len(self.carried) == 1:
+      self.lowerer.register(self.carried[0][3], acc_var)
+    else:
+      for i, (mkey, _, _, memref) in enumerate(self.carried):
+        self.lowerer.register(memref, f"{acc_var}.{i}")
+
+    # Emit body
+    body_updates = self._emit_body_ops()
+
+    # Emit return value (new accumulator state)
+    if len(self.carried) == 1:
+      new_val = body_updates.get(self.carried[0][0], acc_var)
+      self.lines.append(f"{self.indent}  {new_val}")
+    else:
+      new_vals = [body_updates.get(c[0], f"{acc_var}.{i}") for i, c in enumerate(self.carried)]
+      self.lines.append(f"{self.indent}  ({', '.join(new_vals)})")
+
+    self.lines.append(f"{self.indent}}}({init_val});")
+
+    # Update lowerer's value map with results for values used after loop
+    for i, (mkey, _, _, memref) in enumerate(self.carried):
+      if mkey in self.used_after:
+        self.lowerer.register(memref, result_names[i])
+
+  def _emit_body_ops(self):
+    """Emit body operations and return map of memref updates."""
+    body_updates = {}
+    carried_keys = {c[0] for c in self.carried}
+
+    for op in self.body.operations:
+      if isinstance(op, affine_d.AffineYieldOp):
+        continue
+      elif isinstance(op, arith_d.ConstantOp):
+        self.lowerer.inst_emitter.emit(op)
+      elif isinstance(op, memref_d.AllocOp):
+        self.local_temps[str(op.result)] = None
+      elif isinstance(op, affine_d.AffineLoadOp):
+        mkey = str(op.operands[0])
+        if mkey in carried_keys:
+          # Use current accumulator value
+          for i, c in enumerate(self.carried):
+            if c[0] == mkey:
+              self.lowerer.register(op.result, self.lowerer.lookup(c[3]))
+              break
+        elif mkey in self.local_temps:
+          self.lowerer.register(op.result, self.local_temps[mkey])
+        else:
+          for line in self.lowerer.inst_emitter.emit(op):
+            self.lines.append(self.indent + "  " + line.strip())
+      elif isinstance(op, affine_d.AffineStoreOp):
+        val = self.lowerer.lookup(op.operands[0])
+        mkey = str(op.operands[1])
+        if mkey in carried_keys:
+          body_updates[mkey] = val
+          for c in self.carried:
+            if c[0] == mkey:
+              self.lowerer.register(c[3], val)
+              break
+        elif mkey in self.local_temps:
+          self.local_temps[mkey] = val
+      elif isinstance(op, affine_d.AffineForOp) and _is_unrolled_for(op):
+        # Recursively handle nested unrolled for
+        nested = UnrolledForEmitter(self.lowerer, op, self.lines, self.indent + "  ")
+        nested.emit([])
+      else:
+        for line in self.lowerer.inst_emitter.emit(op):
+          self.lines.append(self.indent + "  " + line.strip())
+
+    return body_updates
+
+
 class DslxStatefulLowerer(DslxFuncLowererBase):
+  # Lowerer for stateful (looping) functions.
   uses_memory = False
 
   def __init__(self, func):
@@ -1101,9 +1304,6 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     self.pe_dims = None
     self.systolic_loops = []
     self._analyze_systolic()
-    # Track identities (ids) of loops we explicitly unroll (populated
-    # when emitting `unroll_for` sites). Start empty here.
-    self.unrolled_loop_ids = set()
     if not self.pe_dims or not self.systolic_loops:
       raise RuntimeError("systolic lowerer requires detectable PE dims and systolic loops")
 
@@ -1157,6 +1357,8 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
                 mm = re.match(r's32:([0-9]+)', ub)
                 if mm:
                   numeric_ubs.append(int(mm.group(1)))
+
+
             if len(numeric_ubs) > 2:
               raise NotImplementedError("systolic array with >=2D not supported yet")
             elif len(numeric_ubs) == 1:
@@ -1190,7 +1392,7 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
       raise NotImplementedError("Only literal integer loop bounds supported for unrolling")
     ub = int(m.group(1))
 
-    self.unrolled_loop_ids.add(id(loop_op))
+    op_obj = getattr(loop_op, 'operation', loop_op)
     lines = []
     for i in range(ub):
       lines.extend(body_emitter(i))
@@ -1266,51 +1468,10 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     lines.append(f"    let (result_chans_out, result_chans_in) = chan<{elem_type}, u32:1>[{rows}][{cols}](\"result_chans\");")
     return "\n".join(lines)
 
-  def _prune_unrolled_loops(self):
-    """Remove loops identified as spawn/unrolled from the state's loop
-    tracking lists so they are not emitted as persistent indices.
-
-    This is intentionally systolic-specific so other lowerers are
-    unaffected.
-    """
-    # collect identities (ids) of spawn_pe loop ops using the underlying
-    # MLIR op object when available to increase the chance of a match
-    # with the `self.loops` entries.
-    spawn_ids = set()
-    for entry in self.systolic_loops:
-      if entry.get('kind') != 'spawn_pe':
-        continue
-      op = entry.get('op')
-      op_obj = getattr(op, 'operation', op)
-      spawn_ids.add(id(op_obj))
-    # combine with explicitly recorded unrolled op ids
-    unrolled_ids = set(getattr(self, 'unrolled_loop_ids', []))
-    prune_ids = spawn_ids.union(unrolled_ids)
-    if not prune_ids:
-      return
-    # if there are no previously-discovered loops, nothing to prune
-    if not getattr(self, 'loops', None):
-      return
-    new_loops = []
-    new_preambles = []
-    new_postambles = []
-    new_upper_bounds = []
-    for loop, pre, post, ub in zip(self.loops, self.loop_preambles, self.loop_postambles, self.loop_upper_bounds):
-      # If this loop's id is in the prune set, drop it. We compare
-      # using `id(...)` for stability within the Python process and to
-      # avoid relying on textual UB strings.
-      loop_obj = getattr(loop, 'operation', loop)
-      if id(loop_obj) in prune_ids:
-        continue
-      new_loops.append(loop)
-      new_preambles.append(pre)
-      new_postambles.append(post)
-      new_upper_bounds.append(ub)
-    # replace the old lists with the pruned versions
-    self.loops = new_loops
-    self.loop_preambles = new_preambles
-    self.loop_postambles = new_postambles
-    self.loop_upper_bounds = new_upper_bounds
+  # NOTE: Loop pruning removed per user request. Previously there was a
+  # `_prune_unrolled_loops` helper here to remove unrolled/spawn loops
+  # from `self.loops` so they wouldn't become persistent state indices.
+  # That behavior has been disabled to preserve all loops.
 
   def _discover_pe_dims(self):
     loop_stack = []
@@ -1386,6 +1547,12 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     else:
       cfg_text = self._emit_config()
 
+    if getattr(self, 'loops', None):
+      self.loops = self.loops[:1]
+      self.loop_preambles = self.loop_preambles[:1]
+      self.loop_postambles = self.loop_postambles[:1]
+      self.loop_upper_bounds = self.loop_upper_bounds[:1]
+
     init_section = self._emit_init()
     next_section = self._emit_next()
 
@@ -1397,13 +1564,8 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     func += "}"
     return func
 
-  # Override channel declarations so systolic lowerer sends all inputs
-  # (including memrefs/arrays) through simple data channels. Channel
-  # names prefer the original argument name when present, otherwise
-  # fall back to a positional name.
   def _build_channel_decls(self):
     inputs, outputs = get_func_inputs_outputs(self.func)
-    # include ALL function arguments for systolic path
     func_args = list(self.func.arguments)
     assert len(inputs) == len(func_args), "func arg mismatch"
 
@@ -1417,28 +1579,22 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     for idx, (arg, (dtype, shape)) in enumerate(zip(func_args, inputs)):
       base_type = allo_dtype_to_dslx_type(dtype)
       if shape:
-        # shape is expected to be an iterable of integer dims
-        # Flip the order of dimensions when emitting DSLX so that
-        # a shape (N, K) in Allo becomes a DSLX type `base[K][N]`.
         shape_suffix = "".join(f"[{d}]" for d in reversed(shape))
         dslx_type = f"{base_type}{shape_suffix}"
       else:
         dslx_type = base_type
       self.input_types.append(dslx_type)
-      # prefer a human-readable name if available on the MLIR arg
       arg_name = None
       try:
         arg_name = getattr(arg, 'name', None)
       except Exception:
         arg_name = None
       if not arg_name:
-        # BlockArgument typically exposes arg_number
         try:
           arg_name = f"arg{arg.arg_number}"
         except Exception:
           arg_name = f"in{idx}"
       name = f"{arg_name}"
-      # sanitize name: replace spaces or special chars (conservative)
       name = re.sub(r"[^A-Za-z0-9_]+", "_", name)
       self.inputs[idx] = name
       self.scalar_arg_order.append(arg)
@@ -1448,18 +1604,15 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     for idx, (dtype, shape) in enumerate(outputs):
       base_type = allo_dtype_to_dslx_type(dtype)
       if shape:
-        # Reverse dims for outputs as well (Allo -> DSLX ordering).
         shape_suffix = "".join(f"[{d}]" for d in reversed(shape))
         dslx_type = f"{base_type}{shape_suffix}"
       else:
         dslx_type = base_type
-      # try to name outputs by position
       name = f"out{idx}"
       self.outputs[idx] = name
       channels.append(f"{name}: chan<{dslx_type}> out")
       handles.append(name)
 
-    # include channel candidates discovered earlier (if any)
     if getattr(self, 'uses_channels', False):
       for ci in self.channel_infos:
         dir_decl = 'in' if ci.get('chan_dir') == 'in' else 'out'
@@ -1492,8 +1645,6 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     return channels
 
   def _emit_next(self):
-    # Determine accumulator names and DSLX types.
-    # Prefer shaped types discovered from state entries or input_types via helper.
     if getattr(self, '_get_acc_types', None):
       acc_types = self._get_acc_types()
       n = len(acc_types)
@@ -1508,7 +1659,7 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
         acc_types = [self.input_types[0], self.input_types[1]]
         n = len(acc_types)
         acc_names = [f"acc{i}" for i in range(n)]
-    num_loops = len(self.loops) if self.loops else 1
+    num_loops = 1
 
     # handle while loops separately
     if self.loop_type == 'while':
