@@ -1197,9 +1197,9 @@ class DslxSystolicLowerer(DslxStatefulLowerer):
     lines = []
 
     # Create internal channels
-    lines.append(f"    let (to_hor, from_hor) = chan<{bt}, u32:1>[{rows + 1}][{cols}](\"hor_chans\");")
-    lines.append(f"    let (to_vert, from_vert) = chan<{bt}, u32:1>[{rows}][{cols + 1}](\"vert_chans\");")
-    lines.append(f"    let (result_chans_out, result_chans_in) = chan<{bt}, u32:1>[{rows}][{cols}](\"result_chans\");")
+    lines.append(f"    let (to_hor, from_hor) = chan<{bt}, u32:1>[{cols + 1}][{rows}](\"hor_chans\");")
+    lines.append(f"    let (to_vert, from_vert) = chan<{bt}, u32:1>[{cols}][{rows + 1}](\"vert_chans\");")
+    lines.append(f"    let (result_chans_out, result_chans_in) = chan<{bt}, u32:1>[{cols}][{rows}](\"result_chans\");")
     
     # Spawn PEs
     lines.append(f"    unroll_for! (row, _): (u32, ()) in u32:0..u32:{rows} {{")
